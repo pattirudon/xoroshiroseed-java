@@ -14,6 +14,15 @@ import jp.co.pattirudon.xoroshiroseed.matrices.BinaryMatrix;
 import jp.co.pattirudon.xoroshiroseed.random.Xoroshiro;
 
 public class SeedSolver {
+    static byte[] singleBits(long s0, long s1, int n) {
+        byte[] r = new byte[n];
+        Xoroshiro random = new Xoroshiro(s0, s1);
+        for (int i = 0; i < n; i++) {
+            r[i] = (byte) (random.nextInt() & 1);
+        }
+        return r;
+    }
+
     static BinaryMatrix singleBitsMatrix(int n) {
         byte[][] mat = new byte[128][n];
         for (int i = 0; i < 128; i++) {
@@ -67,7 +76,7 @@ public class SeedSolver {
         }
     }
 
-    private static long toUnsignedLongBE(byte[] b) {
+    private static long toUnsignedLongLE(byte[] b) {
         if (b.length != 64) {
             throw new IllegalArgumentException("The lenght of byte array must be 64.");
         }
@@ -85,7 +94,7 @@ public class SeedSolver {
         long[] a = new long[b.length / 64];
         for (int i = 0; i < a.length; i++) {
             byte[] sub = Arrays.copyOfRange(b, 64 * i, 64 * (i + 1));
-            a[i] = toUnsignedLongBE(sub);
+            a[i] = toUnsignedLongLE(sub);
         }
         return a;
     }
@@ -114,26 +123,90 @@ public class SeedSolver {
     }
 
     public static Entry<List<Integer>, List<long[]>> findSingleState(byte[] motions, int designated, long s,
-            int frameStartInclusive,
-            int frameEndExclusive) {
-        List<long[]> motionStart = solve(motions);
-        List<long[]> gameStart = new ArrayList<>();
-        List<Integer> frameMotionStart = new ArrayList<>();
-        for (int i = 0; i < motionStart.size(); i++) {
-            long[] t = motionStart.get(i);
-            Xoroshiro random = new Xoroshiro(t[0], t[1]);
-            for (int j = 0; j < frameStartInclusive; j++) {
-                random.privious();
-            }
-            for (int j = frameStartInclusive; j < frameEndExclusive; j++) {
-                if (random.s[designated] == s) {
-                    gameStart.add(Arrays.copyOf(random.s, random.s.length));
-                    frameMotionStart.add(j);
-                }
-                random.privious();
-            }
+            int frameStartInclusive, int frameEndExclusive) {
+        List<Xoroshiro> movingXoroshiros = new ArrayList<>(64);
+        Xoroshiro baseXoroshiro;
+        for (int i = 0; i < 64; i++) {
+            long t = 1L << i;
+            long s0 = new long[] { 0, t }[designated];
+            long s1 = new long[] { t, 0 }[designated];
+            Xoroshiro random = new Xoroshiro(s0, s1);
+            movingXoroshiros.add(random);
         }
-        return new SimpleImmutableEntry<>(frameMotionStart, gameStart);
+        {
+            long s0 = new long[] { s, 0 }[designated];
+            long s1 = new long[] { 0, s }[designated];
+            baseXoroshiro = new Xoroshiro(s0, s1);
+        }
+        for (int i = 0; i < frameStartInclusive; i++) {
+            movingXoroshiros.forEach(x -> x.nextInt());
+            baseXoroshiro.nextInt();
+        }
+        LinkedList<byte[]> queueMatrix = new LinkedList<>();
+        LinkedList<Byte> baseQueue = new LinkedList<>();
+        List<long[]> gameStart = new ArrayList<>();
+        List<Integer> foundFrames = new ArrayList<>();
+        for (int i = frameStartInclusive; i < frameEndExclusive + motions.length; i++) {
+            if (motions.length <= queueMatrix.size()) {
+                BinaryMatrix f = BinaryMatrix.getInstance(queueMatrix.size(), movingXoroshiros.size(),
+                        queueMatrix.toArray(byte[][]::new), false).transposed();
+                queueMatrix.removeFirst();
+                BinaryMatrix g = f.generalizedInverse();
+                byte[] base = new byte[baseQueue.size()];
+                for (int j = 0; j < baseQueue.size(); j++) {
+                    base[j] = baseQueue.get(j);
+                }
+                baseQueue.removeFirst();
+                byte[] y = add(motions, base);
+                byte[] x = g.multiplyLeft(y);
+                byte[] check = f.multiplyLeft(x);
+                if (Arrays.equals(y, check)) {
+                    BinaryMatrix h = f.multiplyRight(g).add(BinaryMatrix.ones(movingXoroshiros.size()));
+                    byte[][] nullBasis = h.rowBasis();
+                    int nullRank = nullBasis.length;
+                    if (nullRank >= 16)
+                        throw new IllegalStateException("Too less motions.");
+                    long[] nullLongBasis = new long[nullRank];
+                    for (int j = 0; j < nullRank; j++) {
+                        nullLongBasis[j] = toUnsignedLongLE(nullBasis[j]);
+                    }
+                    long xLong = toUnsignedLongLE(x);
+                    for (int j = 0; j < (1 << nullRank); j++) {
+                        long nullVector = 0;
+                        for (int k = 0; k < nullRank; k++) {
+                            int b = (j >>> k) & 1;
+                            if (b == 1) {
+                                nullVector ^= nullLongBasis[k];
+                            }
+                        }
+                        long s0 = new long[] { s, nullVector ^ xLong }[designated];
+                        long s1 = new long[] { nullVector ^ xLong, s }[designated];
+                        foundFrames.add(i - motions.length);
+                        gameStart.add(new long[] { s0, s1 });
+                    }
+                }
+            }
+            byte[] row = new byte[movingXoroshiros.size()];
+            queueMatrix.addLast(row);
+            for (int j = 0; j < movingXoroshiros.size(); j++) {
+                Xoroshiro x = movingXoroshiros.get(j);
+                row[j] = (byte) (x.nextInt() & 1);
+            }
+            byte b = (byte) (baseXoroshiro.nextInt() & 1);
+            baseQueue.addLast(b);
+        }
+        return new SimpleImmutableEntry<>(foundFrames, gameStart);
+    }
+
+    public static byte[] add(byte[] a, byte[] b) {
+        if (a.length != b.length) {
+            throw new IllegalArgumentException("The lengths of two byte arrays must be same.");
+        }
+        byte[] c = new byte[a.length];
+        for (int i = 0; i < a.length; i++) {
+            c[i] = (byte) (a[i] ^ b[i]);
+        }
+        return c;
     }
 
     public static void list(SeedSolverConfig config, Logger logger) {
